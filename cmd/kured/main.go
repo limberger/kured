@@ -52,6 +52,8 @@ var (
 
 	annotationTTL time.Duration
 
+	drainTimeout time.Duration
+
 	// Metrics
 	rebootRequiredGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Subsystem: "kured",
@@ -106,6 +108,9 @@ func main() {
 
 	rootCmd.PersistentFlags().DurationVar(&annotationTTL, "annotation-ttl", 0,
 		"force clean annotation after this ammount of time (default 0, disabled)")
+
+	rootCmd.PersistentFlags().DurationVar(&drainTimeout, "drain-timeout", 0,
+		"the length of time to wait before giving up to drain the node, zero means infinite. In case of timeout the boot will occurs  (default 0 means infinite)")
 
 	if err := rootCmd.Execute(); err != nil {
 		log.Fatal(err)
@@ -270,7 +275,7 @@ func release(lock *daemonsetlock.DaemonSetLock) {
 	}
 }
 
-func drain(nodeID string) {
+func drain(nodeID string, DrainTimeout time.Duration) {
 	log.Infof("Draining node %s", nodeID)
 
 	if slackHookURL != "" {
@@ -280,7 +285,7 @@ func drain(nodeID string) {
 	}
 
 	drainCmd := newCommand("/usr/bin/kubectl", "drain",
-		"--ignore-daemonsets", "--delete-local-data", "--force", nodeID)
+		"--ignore-daemonsets", "--delete-local-data", "--force", "--timeout", DrainTimeout.String(), nodeID)
 
 	if err := drainCmd.Run(); err != nil {
 		log.Fatalf("Error invoking drain command: %v", err)
@@ -324,7 +329,7 @@ type nodeMeta struct {
 	Unschedulable bool `json:"unschedulable"`
 }
 
-func rebootAsRequired(nodeID string, window *timewindow.TimeWindow, TTL time.Duration, pid int) {
+func rebootAsRequired(nodeID string, window *timewindow.TimeWindow, TTL time.Duration, DrainTimeout time.Duration, pid int) {
 	config, err := rest.InClusterConfig()
 	if err != nil {
 		log.Fatal(err)
@@ -367,7 +372,7 @@ func rebootAsRequired(nodeID string, window *timewindow.TimeWindow, TTL time.Dur
 
 			if acquire(lock, &nodeMeta, TTL) {
 				if !nodeMeta.Unschedulable {
-					drain(nodeID)
+					drain(nodeID, DrainTimeout)
 				}
 				commandReboot(nodeID, rebootCmd)
 				for {
@@ -402,13 +407,18 @@ func root(cmd *cobra.Command, args []string) {
 	} else {
 		log.Info("Force annotation cleanup disabled.")
 	}
+	if drainTimeout > 0 {
+		log.Infof("The drain will giving up after: %v", drainTimeout)
+	} else {
+		log.Info("The drain will  not giving up (infinite).")
+	}
 
 	pid, err := getPIDtoRunCmds()
 	if err != nil {
 		log.Fatalf("Error getting the pid os proc 1: %v", err)
 	}
 
-	go rebootAsRequired(nodeID, window, annotationTTL, pid)
+	go rebootAsRequired(nodeID, window, annotationTTL, drainTimeout, pid)
 	go maintainRebootRequiredMetric(nodeID, pid)
 
 	http.Handle("/metrics", promhttp.Handler())
